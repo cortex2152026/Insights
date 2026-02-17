@@ -213,12 +213,7 @@ export async function middleware(request: NextRequest, context: NextFetchEvent) 
   // Skip session refresh for routes that don't require it
   // This prevents cookie manipulation that could interfere with the user's session
   if (shouldSkipSessionRefresh(pathname)) {
-    // Log request without user ID for skipped routes (T222)
-    if (isRequestLoggingEnabled()) {
-      context.waitUntil(
-        logRequest(createLogEntry(clientIp, pathname, 200, null))
-      );
-    }
+    // Do not log here: middleware cannot reliably know final status code.
     return supabaseResponse;
   }
 
@@ -265,16 +260,9 @@ export async function middleware(request: NextRequest, context: NextFetchEvent) 
   // - getUser() makes a request to Supabase Auth to refresh the token
   // - getClaims() only validates the JWT locally and does NOT refresh tokens
   // See: https://supabase.com/docs/guides/auth/server-side/creating-a-client
-  const { data: { user } } = await supabase.auth.getUser();
+  await supabase.auth.getUser();
 
-  // --- Request Logging (T222) ---
-  // Log request with user ID if authenticated
-  if (isRequestLoggingEnabled()) {
-    context.waitUntil(
-      logRequest(createLogEntry(clientIp, pathname, 200, user?.id ?? null))
-    );
-  }
-
+  // Request logging is handled at route/action level where real response status is known.
   return supabaseResponse;
 }
 
