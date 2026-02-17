@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { reportError } from "@/lib/observability";
 
 /**
  * Validates that a redirect path is a safe relative URL.
@@ -71,22 +72,20 @@ export async function GET(request: NextRequest) {
   const { error } = await supabase.auth.exchangeCodeForSession(code);
 
   if (error) {
-    // Log detailed error for debugging (server-side only)
-    console.error("Auth callback error:", {
-      message: error.message,
-      status: error.status,
-      code: error.code,
+    reportError(error, {
+      event: "auth_callback_exchange_failed",
+      route: "/auth/callback",
     });
-    
+
     // If the code was already used or expired, the user might already be logged in
     // from a previous attempt. Check if we have a valid session.
-    const { data: { user } } = await supabase.auth.getUser();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
     if (user) {
-      // User is already authenticated, redirect to success
-      console.log("Auth callback: User already authenticated despite error, redirecting to success");
       return NextResponse.redirect(`${origin}${next}`);
     }
-    
+
     return NextResponse.redirect(`${origin}/?error=auth_failed`);
   }
 
