@@ -793,18 +793,23 @@ describe("URL validation", () => {
 
     expect(result.success).toBe(false);
     if (!result.success) {
-      expect(result.error).toBe("Localhost URLs are not allowed in production");
+      expect(result.error).toBe("Local/internal webhook hostnames are not allowed in production");
     }
   });
 
-  it("rejects 127.0.0.1 in production environment", async () => {
+  it("rejects loopback/private IPs in production environment", async () => {
     vi.stubEnv("NODE_ENV", "production");
 
-    const result = await createWebhook({ url: "https://127.0.0.1/webhook" });
+    const loopback = await createWebhook({ url: "https://127.0.0.1/webhook" });
+    expect(loopback.success).toBe(false);
+    if (!loopback.success) {
+      expect(loopback.error).toBe("Private or loopback IP addresses are not allowed in production");
+    }
 
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error).toBe("Localhost URLs are not allowed in production");
+    const privateIp = await createWebhook({ url: "https://10.0.0.1/webhook" });
+    expect(privateIp.success).toBe(false);
+    if (!privateIp.success) {
+      expect(privateIp.error).toBe("Private or loopback IP addresses are not allowed in production");
     }
   });
 });

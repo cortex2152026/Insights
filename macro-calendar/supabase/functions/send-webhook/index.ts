@@ -89,6 +89,114 @@ const MAX_RESPONSE_BODY_LENGTH = 1024; // Truncate response body for storage
 // Discord embed color - 0x58C7FF (blue) in decimal = 5818367
 const DISCORD_EMBED_COLOR = 5818367;
 
+function isIpv4(value: string): boolean {
+  const parts = value.split(".");
+  if (parts.length !== 4) return false;
+  return parts.every((part) => {
+    if (!/^\d+$/.test(part)) return false;
+    const n = Number(part);
+    return n >= 0 && n <= 255;
+  });
+}
+
+function isIpv6(value: string): boolean {
+  // Lightweight check (enough for routing decisions)
+  return value.includes(":");
+}
+
+function isPrivateOrUnsafeIp(ip: string): boolean {
+  const normalized = ip.toLowerCase();
+
+  // IPv4-mapped IPv6
+  if (normalized.startsWith("::ffff:")) {
+    const mapped = normalized.replace("::ffff:", "");
+    return isPrivateOrUnsafeIp(mapped);
+  }
+
+  if (isIpv4(normalized)) {
+    const [a, b] = normalized.split(".").map(Number);
+
+    if (a === 10) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 127) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+    if (a === 0) return true;
+
+    return false;
+  }
+
+  if (isIpv6(normalized)) {
+    if (normalized === "::1" || normalized === "::") return true;
+    if (normalized.startsWith("fe80:")) return true;
+    if (normalized.startsWith("fc") || normalized.startsWith("fd")) return true;
+    return false;
+  }
+
+  return false;
+}
+
+async function resolveHostnameIps(hostname: string): Promise<string[]> {
+  const out = new Set<string>();
+
+  try {
+    const a = await Deno.resolveDns(hostname, "A");
+    for (const entry of a) out.add(String(entry));
+  } catch {
+    // ignore
+  }
+
+  try {
+    const aaaa = await Deno.resolveDns(hostname, "AAAA");
+    for (const entry of aaaa) out.add(String(entry));
+  } catch {
+    // ignore
+  }
+
+  return [...out];
+}
+
+async function validateOutboundWebhookUrl(url: string): Promise<{ valid: true } | { valid: false; error: string }> {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return { valid: false, error: "Invalid webhook URL" };
+  }
+
+  if (parsed.protocol !== "https:") {
+    return { valid: false, error: "Webhook URL must use HTTPS" };
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+
+  if (
+    hostname === "localhost" ||
+    hostname.endsWith(".localhost") ||
+    hostname.endsWith(".local") ||
+    hostname.endsWith(".internal")
+  ) {
+    return { valid: false, error: "Local/internal webhook hostnames are blocked" };
+  }
+
+  if ((isIpv4(hostname) || isIpv6(hostname)) && isPrivateOrUnsafeIp(hostname)) {
+    return { valid: false, error: "Private/internal webhook IP addresses are blocked" };
+  }
+
+  if (!isIpv4(hostname) && !isIpv6(hostname)) {
+    const resolvedIps = await resolveHostnameIps(hostname);
+    if (resolvedIps.length === 0) {
+      return { valid: false, error: "Webhook hostname could not be resolved" };
+    }
+    if (resolvedIps.some((ip) => isPrivateOrUnsafeIp(ip))) {
+      return { valid: false, error: "Webhook hostname resolves to private/internal IP" };
+    }
+  }
+
+  return { valid: true };
+}
+
 /**
  * Determine if a request should be retried based on status code.
  * - 2xx: Success, no retry needed
@@ -321,6 +429,26 @@ async function deliverWebhook(
     : createStandardPayload(eventType, indicator, release);
 
   const payloadString = JSON.stringify(payload);
+
+  // Re-validate outbound target at delivery time to reduce SSRF/DNS-rebinding risk.
+  const outboundValidation = await validateOutboundWebhookUrl(endpoint.url);
+  if (!outboundValidation.valid) {
+    await logDeliveryAttempt(
+      endpoint.id,
+      eventType,
+      payload,
+      null,
+      outboundValidation.error
+    );
+
+    return {
+      endpoint_id: endpoint.id,
+      success: false,
+      status_code: null,
+      attempts: 1,
+      error: outboundValidation.error,
+    };
+  }
 
   // Build headers - Discord doesn't use custom webhook headers
   const headers: Record<string, string> = {

@@ -2,6 +2,8 @@
 
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { randomBytes } from "crypto";
+import { lookup } from "dns/promises";
+import net from "net";
 import { z } from "zod";
 
 // Valid event types for webhook subscriptions
@@ -17,12 +19,61 @@ function isProduction(): boolean {
 }
 
 /**
+ * Check whether an IP is private/link-local/loopback/otherwise unsafe for webhook egress.
+ */
+function isPrivateOrUnsafeIp(ip: string): boolean {
+  const normalized = ip.toLowerCase();
+
+  // IPv4-mapped IPv6 (e.g., ::ffff:127.0.0.1)
+  if (normalized.startsWith("::ffff:")) {
+    const mapped = normalized.replace("::ffff:", "");
+    return isPrivateOrUnsafeIp(mapped);
+  }
+
+  const version = net.isIP(normalized);
+
+  if (version === 4) {
+    const [a, b] = normalized.split(".").map(Number);
+
+    // RFC1918 + loopback + link-local + carrier-grade NAT + unspecified
+    if (a === 10) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 127) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+    if (a === 0) return true;
+
+    return false;
+  }
+
+  if (version === 6) {
+    // loopback, link-local, unique local, unspecified
+    if (normalized === "::1" || normalized === "::") return true;
+    if (normalized.startsWith("fe80:")) return true;
+    if (normalized.startsWith("fc") || normalized.startsWith("fd")) return true;
+    return false;
+  }
+
+  return false;
+}
+
+async function resolveHostnameIps(hostname: string): Promise<string[]> {
+  try {
+    const records = await lookup(hostname, { all: true, verbatim: true });
+    return [...new Set(records.map((record) => record.address))];
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Validate a webhook URL.
  * - Must be a valid URL
  * - Must use HTTPS
- * - Cannot be localhost in production
+ * - Cannot target localhost/private networks in production
  */
-function validateWebhookUrl(url: string): { valid: true } | { valid: false; error: string } {
+async function validateWebhookUrl(url: string): Promise<{ valid: true } | { valid: false; error: string }> {
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -35,17 +86,36 @@ function validateWebhookUrl(url: string): { valid: true } | { valid: false; erro
     return { valid: false, error: "Webhook URL must use HTTPS" };
   }
 
-  // Block localhost in production
-  if (isProduction()) {
-    const hostname = parsed.hostname.toLowerCase();
-    if (
-      hostname === "localhost" ||
-      hostname === "127.0.0.1" ||
-      hostname === "0.0.0.0" ||
-      hostname === "::1" ||
-      hostname.endsWith(".localhost")
-    ) {
-      return { valid: false, error: "Localhost URLs are not allowed in production" };
+  if (!isProduction()) {
+    return { valid: true };
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+
+  // Block obvious local/internal hostnames
+  if (
+    hostname === "localhost" ||
+    hostname.endsWith(".localhost") ||
+    hostname.endsWith(".local") ||
+    hostname.endsWith(".internal")
+  ) {
+    return { valid: false, error: "Local/internal webhook hostnames are not allowed in production" };
+  }
+
+  // Direct IP targets
+  if (net.isIP(hostname) && isPrivateOrUnsafeIp(hostname)) {
+    return { valid: false, error: "Private or loopback IP addresses are not allowed in production" };
+  }
+
+  // DNS resolution check to reduce SSRF risk via public hostname -> private IP
+  if (!net.isIP(hostname)) {
+    const resolvedIps = await resolveHostnameIps(hostname);
+    if (resolvedIps.length === 0) {
+      return { valid: false, error: "Webhook hostname could not be resolved" };
+    }
+
+    if (resolvedIps.some((ip) => isPrivateOrUnsafeIp(ip))) {
+      return { valid: false, error: "Webhook hostname resolves to a private/internal IP" };
     }
   }
 
@@ -196,7 +266,7 @@ export async function createWebhook(input: {
   }
 
   // Validate URL (HTTPS required, no localhost in production)
-  const urlValidation = validateWebhookUrl(parseResult.data.url);
+  const urlValidation = await validateWebhookUrl(parseResult.data.url);
   if (!urlValidation.valid) {
     return { success: false, error: urlValidation.error };
   }
@@ -289,7 +359,7 @@ export async function updateWebhook(
 
   // Validate URL if provided
   if (updateData.url !== undefined) {
-    const urlValidation = validateWebhookUrl(updateData.url);
+    const urlValidation = await validateWebhookUrl(updateData.url);
     if (!urlValidation.valid) {
       return { success: false, error: urlValidation.error };
     }
